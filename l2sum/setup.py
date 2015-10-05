@@ -1,5 +1,6 @@
 from setuptools import setup, Extension
 import os
+import numpy 
 
 def build_extension():
 
@@ -17,6 +18,7 @@ def build_extension():
         sources=[
             os.path.join("l2sum", "_learn{}".format(ext)),
         ],
+        include_dirs = [numpy.get_include()],
         #extra_compile_args=["-std=c11" ],
         #extra_compile_args=["-O9", "-std=c11" ],
         #extra_link_args=["-O9"],

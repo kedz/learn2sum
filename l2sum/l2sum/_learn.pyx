@@ -1,4 +1,8 @@
+#cython: boundscheck=False
+#cython: wraparound=False
 from cpyvw cimport SearchTask
+import numpy as np
+cimport numpy as np
 import pandas as pd
 from nltk.util import ngrams
 from collections import defaultdict
@@ -6,18 +10,14 @@ import os
 import pyvw
 import pylibvw
 from itertools import izip
-from sklearn.feature_extraction import DictVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from scipy.sparse import vstack
 
 duc03_model_path = os.path.join(
     os.getenv("DUC_DATA"),
     "detagged.duc2003.abstracts/models/")
-def make_counts(lemmas):
-    counts = defaultdict(int)
-    for lemma in lemmas:
-        counts[lemma] += 1
-    return counts
+
+INT_DTYPE = np.int
+DBL_DTYPE = np.double
 
 
 
@@ -27,66 +27,89 @@ cdef class L2SSum(SearchTask):
         sch.set_options(sch.IS_LDF)
 
 
-    def compute_oracle_scores(self, model_ngrams, Z, 
-            summary_ngrams, input_ngrams):
-        def score_ngrams(input_ng):
+    def compute_oracle_scores(self, model_ngrams, model_Z, 
+            summary_ngrams, summary_Z, input_ngrams, input_Z):
+        def score_ngrams(item):
+            (input_ng, input_z) = item
             score = 0
             for ng in set(input_ng.keys() + summary_ngrams.keys()):
                 score += min(
                     model_ngrams[ng], input_ng[ng] + summary_ngrams[ng])
-            return score / float(Z)
-        scores = map(score_ngrams, input_ngrams)
+            if score > 0:
+                rec = score / float(model_Z)
+                prec = score / float(summary_Z + input_z)
+                return 2 * (rec * prec) / (rec + prec)
+            else:
+                return 0
+        scores = map(score_ngrams, zip(input_ngrams, input_Z))
         return scores
 
-    cdef object make_examples(L2SSum self, object oscores, object inputs, 
-            object cols, object Xsum_tf, object Xinp_tf):
+    cdef void update_examples(L2SSum self, object examples, int sim_start, 
+            np.ndarray[DBL_DTYPE_t, ndim=2] Kinp_tf, 
+            object summary_i, object index, 
+            np.ndarray[DBL_DTYPE_t, ndim=2] Xinp_sf):
 
-        Ktf = cosine_similarity(Xinp_tf, Xsum_tf)
-        max_tf_sims = Ktf.max(axis=1)
-        mean_tf_sims = Ktf.mean(axis=1)
+        cdef np.ndarray[DBL_DTYPE_t, ndim=2] K_inp_x_sum
+        cdef np.ndarray[DBL_DTYPE_t, ndim=2] X
+        cdef np.ndarray[DBL_DTYPE_t, ndim=1] max_tf_sims
+        cdef np.ndarray[DBL_DTYPE_t, ndim=1] mean_tf_sims
+        cdef np.ndarray[DBL_DTYPE_t, ndim=2] X_int_max_tf_sims
+        cdef np.ndarray[DBL_DTYPE_t, ndim=2] X_int_mean_tf_sims
+       
+        cdef int i, j
+
+        if len(summary_i) > 0:
+            K_inp_x_sum = Kinp_tf[:,summary_i][index,:]
+            max_tf_sims = K_inp_x_sum.max(axis=1)
+            mean_tf_sims = K_inp_x_sum.mean(axis=1)
+        else:
+            max_tf_sims =  np.zeros(len(index), dtype=DBL_DTYPE)
+            mean_tf_sims = max_tf_sims
+        X = Xinp_sf[index,:]
+        X_int_max_tf_sims = X * max_tf_sims[:, np.newaxis]
+        X_int_mean_tf_sims = X * mean_tf_sims[:, np.newaxis]
         
-        X = inputs[cols].values
-
-        cdef list examples = []
-        cdef double tf_max, tf_mean;
-
-        for x, tf_max, tf_mean in izip(X, max_tf_sims, mean_tf_sims):
-            feats = [(f_i, x_i) if x_i != 0 else (f_i +"==0", 1.) 
-                     for f_i, x_i in izip(cols, x)]
-            tf_max_feat = \
-                ("MAX_TF_SIM", tf_max) if tf_max != 0 else ("MAX_TF_SIM==0",1.)
-            tf_mean_feat = \
-              ("MEAN_TF_SIM",tf_mean) if tf_mean!=0 else ("MEAN_TF_SIM==0", 1.)
-
-            interactions = [(f_i+"^MAX_TF_SIM", tf_max *x_i)
-                            for f_i, x_i in feats]  
-            feats += interactions + [tf_max_feat, tf_mean_feat]
-
-            fd = {"a": feats}
-            #if self.sch.predict_needs_example():
-            #    print fd
-            ex = self.vw.example(fd,
-                                 labelType=self.vw.lCostSensitive)
-            examples.append(ex)
-
-        return examples
+        for i in range(len(index)):
+            examples[i].pop_namespace()     
+            examples[i].push_namespace('b')     
+            if max_tf_sims[i] > 0.:
+                examples[i].push_features(
+                    'b', [(sim_start, max_tf_sims[i]), (sim_start + 1, 0)])
+            else:
+                examples[i].push_features(
+                    'b', [(sim_start, 0.), (sim_start + 1, 1.)])
+            if mean_tf_sims[i] > 0.:
+                examples[i].push_features(
+                    'b', [(sim_start + 2, mean_tf_sims[i]), (sim_start+3, 0)])
+            else:
+                examples[i].push_features(
+                    'b', [(sim_start+2, 0.), (sim_start + 3, 1.)])
+            offset = sim_start + 4 - 1
+            interactions = [(offset + j, X_int_max_tf_sims[i,j])
+                            for j in range(1, sim_start)]
+            offset = sim_start + 4 -1 + X.shape[1] - 1
+            interactions.extend(
+                [(offset + j, X_int_mean_tf_sims[i,j]) 
+                 for j in range(1, sim_start)])
+            examples[i].push_features('b', interactions)
 
     cdef object _run(self, object instance):
-        model_ngrams, Z_recall, input_ngrams, input_Z, inputs = instance
+
+        (model_ngrams, Z_recall, input_ngrams, input_Z, 
+         inputs, Kinp_tf, Xinp_sf, examples, fi) = instance
+
+        oracle_I = []
+
         cdef int summary_length = 0
         summary_ngrams = defaultdict(int)
+        cdef double summary_Z = 0.0
         input_ngrams = list(input_ngrams)
+        input_Z = list(input_Z)
+        examples = list(examples)
         index = inputs.index.tolist()
          
-        vec = DictVectorizer()
-        Xinp_tf = inputs["lemmas"].apply(make_counts)
-        Xinp_tf = vec.fit_transform(Xinp_tf)
-        
-        Xsum_tf = None
         word_lengths = inputs["word length"]
 
-        cdef list cols = [c for c in inputs.columns
-                if "INPUT" in c or "DOC" in c or "SENT" in c]
         cdef list summary_i = []
 
         cdef int n = 0
@@ -96,33 +119,39 @@ cdef class L2SSum(SearchTask):
         while summary_length < 100:
             n+=1
             scores = self.compute_oracle_scores(model_ngrams, Z_recall, 
-                    summary_ngrams, input_ngrams)
+                    summary_ngrams, summary_Z, input_ngrams, input_Z)
             oracle_score = max(scores)
             oracle = scores.index(oracle_score)
             oracle_i = index[oracle]
             
             if self.sch.predict_needs_example():
-                examples = self.make_examples(
-                    scores, inputs.iloc[index], cols, 
-                    Xsum_tf, Xinp_tf[index,:])
-            else:
-                examples = [None] * len(index)
+                self.update_examples(
+                    examples, fi.sim_start, Kinp_tf, summary_i, index,
+                    Xinp_sf)
+                
+                #examples = self.make_examples(
+                #    scores, inputs.iloc[index], cols, Kinp_tf, summary_i, index)
+            #else:
+            #    examples = [None] * len(index)
 
             action = self.sch.predict(
                 examples=examples, my_tag=n, oracle=oracle, condition=[])
+            if self.sch.predict_needs_example():
+                oracle_I.append(oracle_i)
+            
             action_score = scores[action]
             action_i = index[action]
 
             summary_length += word_lengths[action_i]
             summary_i.append(action_i)
-            Xsum_tf = Xinp_tf[summary_i, :]
-                
+            summary_Z ++ input_Z[action]
 
             for ng, count in input_ngrams[action].items():
                 summary_ngrams[ng] += count
             del index[action]
             del input_ngrams[action]
-            
+            del input_Z[action]
+            del examples[action]
 
         score = 0 
         Z_prec = 0.
@@ -146,13 +175,16 @@ cdef class L2SSum(SearchTask):
         # run 3 .9 f1 - .1 len
 
         # run 4
-        loss = (1. - f1) 
+        loss = .5 * (1. - f1) + .5 * (Kinp_tf[:, summary_i][summary_i,:]).mean()
+
         self.sch.loss(loss)
 
         if self.sch.predict_needs_example():
             print inputs.iloc[summary_i][["doc id", "sent id", "text"]]
+            print "oracle"
+            print inputs.iloc[oracle_I][["doc id", "sent id", "text"]]
             print loss, "f1",f1, "prec", prec, "recall", recall
-            print Xsum_tf.shape
+
         return summary_i
 
 def main():
