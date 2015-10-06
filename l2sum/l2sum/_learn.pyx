@@ -26,6 +26,8 @@ cdef class L2SSum(SearchTask):
         SearchTask.__init__(self, vw , sch, num_actions)
         sch.set_options(sch.IS_LDF)
 
+    def set_alpha(self, alpha):
+        self.alpha = alpha
 
     def compute_oracle_scores(self, model_ngrams, model_Z, 
             summary_ngrams, summary_Z, input_ngrams, input_Z):
@@ -175,7 +177,8 @@ cdef class L2SSum(SearchTask):
         # run 3 .9 f1 - .1 len
 
         # run 4
-        loss = .5 * (1. - f1) + .5 * (Kinp_tf[:, summary_i][summary_i,:]).mean()
+        loss = self.alpha * (1. - f1) + \
+            (1. - self.alpha) * (Kinp_tf[:, summary_i][summary_i,:]).mean()
 
         self.sch.loss(loss)
 
