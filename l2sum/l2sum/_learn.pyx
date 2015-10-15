@@ -26,27 +26,100 @@ cdef class L2SSum(SearchTask):
         SearchTask.__init__(self, vw , sch, num_actions)
         sch.set_options(sch.IS_LDF)
 
-    def set_alpha(self, alpha):
-        self.alpha = alpha
+    def set_loss_func(self, loss_func):
+        if loss_func == "r":
+            self.score_func = 0
+        elif loss_func == "p":
+            self.score_func = 1
+        elif loss_func == "f":
+            self.score_func = 2
+        else:
+            raise Exception("Bad loss function")
+    def get_loss_func(self):
+        if self.score_func == 0:
+            return "r"
+        elif self.score_func == 1:
+            return "p"
+        elif self.score_func == 2:
+            return "f"
 
-    def compute_oracle_scores(self, model_ngrams, model_Z, 
-            summary_ngrams, summary_Z, input_ngrams, input_Z):
-        def score_ngrams(item):
-            (input_ng, input_z) = item
-            score = 0
-            for ng in set(input_ng.keys() + summary_ngrams.keys()):
-                score += min(
-                    model_ngrams[ng], input_ng[ng] + summary_ngrams[ng])
-            if score > 0:
-                rec = score / float(model_Z)
-                prec = score / float(summary_Z + input_z)
-                return 2 * (rec * prec) / (rec + prec)
-            else:
-                return 0
-        scores = map(score_ngrams, zip(input_ngrams, input_Z))
+    cdef double _compute_r(L2SSum self, list model_ngrams, 
+            object summary_tokens):
+        sum_counts = {}
+        cdef object k
+        cdef double inters, v, macro_f1, rec
+        for tok in summary_tokens[:100]:
+            sum_counts[tok] = sum_counts.get(tok, 0.) + 1.
+        macro_f1 = 0.
+        for model_counts, model_Z in model_ngrams:
+            inters = 0.
+            for k, v in sum_counts.items():
+                inters += min(v, model_counts.get(k, 0.))
+            if inters > 0.:
+                rec = inters / model_Z
+                macro_f1 += rec  
+        return macro_f1 / len(model_ngrams)
+
+    cdef double _compute_p(L2SSum self, list model_ngrams, 
+            object summary_tokens):
+        sum_counts = {}
+        cdef object k
+        cdef double inters, v, macro_f1, prec
+        for tok in summary_tokens[:100]:
+            sum_counts[tok] = sum_counts.get(tok, 0.) + 1.
+        macro_f1 = 0.
+        for model_counts, model_Z in model_ngrams:
+            inters = 0.
+            for k, v in sum_counts.items():
+                inters += min(v, model_counts.get(k, 0.))
+            if inters > 0.:
+                prec = inters / min(len(sum_counts), 100)
+                macro_f1 += prec
+        return macro_f1 / len(model_ngrams)
+
+    cdef double _compute_f1(L2SSum self, list model_ngrams, 
+            object summary_tokens):
+        sum_counts = {}
+        cdef object k
+        cdef double inters, v, macro_f1, rec, prec
+        for tok in summary_tokens[:100]:
+            sum_counts[tok] = sum_counts.get(tok, 0.) + 1.
+        macro_f1 = 0.
+        for model_counts, model_Z in model_ngrams:
+            inters = 0.
+            for k, v in sum_counts.items():
+                inters += min(v, model_counts.get(k, 0.))
+            if inters > 0.:
+                rec = inters / model_Z
+                prec = inters / min(len(sum_counts), 100)
+                macro_f1 += 2. * (rec * prec ) / (rec + prec)
+        return macro_f1 / len(model_ngrams)
+
+    def compute_oracle_scores(self, model_ngrams, summary_tokens, 
+            input_tokens):
+        cdef int i
+        if self.score_func == 0:        
+            scores = [
+                self._compute_r(
+                    model_ngrams, summary_tokens + input_tokens[i])
+                for i in range(len(input_tokens))]
+        elif self.score_func == 1:
+            scores = [
+                self._compute_p(
+                    model_ngrams, summary_tokens + input_tokens[i])
+                for i in range(len(input_tokens))]
+        elif self.score_func == 2:
+            scores = [
+                self._compute_f1(
+                    model_ngrams, summary_tokens + input_tokens[i])
+                for i in range(len(input_tokens))]
+        #if self.sch.predict_needs_example():
+        #    print scores
+
         return scores
 
     cdef void update_examples(L2SSum self, object examples, int sim_start, 
+            int int_start, int use_interactions,
             np.ndarray[DBL_DTYPE_t, ndim=2] Kinp_tf, 
             object summary_i, object index, 
             np.ndarray[DBL_DTYPE_t, ndim=2] Xinp_sf):
@@ -86,30 +159,29 @@ cdef class L2SSum(SearchTask):
             else:
                 examples[i].push_features(
                     'b', [(sim_start+2, 0.), (sim_start + 3, 1.)])
-            offset = sim_start + 4 - 1
-            interactions = [(offset + j, X_int_max_tf_sims[i,j])
-                            for j in range(1, sim_start)]
-            offset = sim_start + 4 -1 + X.shape[1] - 1
-            interactions.extend(
-                [(offset + j, X_int_mean_tf_sims[i,j]) 
-                 for j in range(1, sim_start)])
-            examples[i].push_features('b', interactions)
+            if use_interactions == 1:
+                offset = sim_start + 4 - 1
+                interactions = [(offset + j, X_int_max_tf_sims[i,j])
+                                for j in range(1, sim_start)]
+                offset = sim_start + 4 -1 + X.shape[1] - 1
+                interactions.extend(
+                    [(offset + j, X_int_mean_tf_sims[i,j]) 
+                     for j in range(1, sim_start)])
+                examples[i].push_features('b', interactions)
 
     cdef object _run(self, object instance):
 
-        (model_ngrams, Z_recall, input_ngrams, input_Z, 
+        (model_ngrams,  
          inputs, Kinp_tf, Xinp_sf, examples, fi) = instance
 
         oracle_I = []
 
         cdef int summary_length = 0
-        summary_ngrams = defaultdict(int)
-        cdef double summary_Z = 0.0
-        input_ngrams = list(input_ngrams)
-        input_Z = list(input_Z)
+        summary_tokens = []
         examples = list(examples)
         index = inputs.index.tolist()
-         
+        input_tokens = inputs["tokens"].apply(
+            lambda x: [xi.lower() for xi in x]).tolist()
         word_lengths = inputs["word length"]
 
         cdef list summary_i = []
@@ -120,15 +192,17 @@ cdef class L2SSum(SearchTask):
         cdef double action_score, score, loss, count
         while summary_length < 100:
             n+=1
-            scores = self.compute_oracle_scores(model_ngrams, Z_recall, 
-                    summary_ngrams, summary_Z, input_ngrams, input_Z)
+            scores = self.compute_oracle_scores(
+                    model_ngrams, summary_tokens, input_tokens)
             oracle_score = max(scores)
             oracle = scores.index(oracle_score)
             oracle_i = index[oracle]
             
             if self.sch.predict_needs_example():
                 self.update_examples(
-                    examples, fi.sim_start, Kinp_tf, summary_i, index,
+                    examples, fi.sim_start, fi.int_start,
+                    1 if fi.use_interactions else 0,
+                    Kinp_tf, summary_i, index,
                     Xinp_sf)
                 
                 #examples = self.make_examples(
@@ -144,29 +218,31 @@ cdef class L2SSum(SearchTask):
             action_score = scores[action]
             action_i = index[action]
 
+            
+
             summary_length += word_lengths[action_i]
             summary_i.append(action_i)
-            summary_Z ++ input_Z[action]
+            summary_tokens += input_tokens[action]
 
-            for ng, count in input_ngrams[action].items():
-                summary_ngrams[ng] += count
             del index[action]
-            del input_ngrams[action]
-            del input_Z[action]
             del examples[action]
+            del input_tokens[action]
+            
+            aslice = Kinp_tf[:, index][action_i,:]
+            loc = np.where(aslice == 1.)[0]
+            while loc.shape[0] > 0:
+                dup_I = index[loc[0]]
+                #print inputs.iloc[action_i]["text"]
+                #print inputs.iloc[dup_I]["text"]
+                #print input_tokens[loc[0]]
+                #print
+                del index[loc[0]]
+                del examples[loc[0]]
+                del input_tokens[loc[0]]
+                aslice = Kinp_tf[:, index][action_i,:]
+                loc = np.where(aslice == 1.)[0]
 
-        score = 0 
-        Z_prec = 0.
-        for ng, count in summary_ngrams.items():
-            score += min(model_ngrams[ng], count)
-            Z_prec += count
-        prec = score / Z_prec if Z_prec > 0 else 0
-        recall = score / Z_recall    
-        cdef double f1 
-        if prec == 0 or recall == 0:
-            f1 = 0.
-        else:
-            f1 = 2 * (prec * recall) / (prec + recall)
+
         #score = score / Z 
         #loss = 1 - score + len(summary_i)
 
@@ -177,6 +253,7 @@ cdef class L2SSum(SearchTask):
         # run 3 .9 f1 - .1 len
 
         # run 4
+        f1 = action_score
         loss = self.alpha * (1. - f1) + \
             (1. - self.alpha) * (Kinp_tf[:, summary_i][summary_i,:]).mean()
 
@@ -186,7 +263,8 @@ cdef class L2SSum(SearchTask):
             print inputs.iloc[summary_i][["doc id", "sent id", "text"]]
             print "oracle"
             print inputs.iloc[oracle_I][["doc id", "sent id", "text"]]
-            print loss, "f1",f1, "prec", prec, "recall", recall
+            print loss
+            #"f1",f1, "prec", prec, "recall", recall
 
         return summary_i
 

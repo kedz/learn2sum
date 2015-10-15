@@ -21,7 +21,8 @@ def get_model_paths(docset):
 
 
 class FeatureIndexer(object):
-    def __init__(self, features):
+    def __init__(self, features, interactions=False):
+        self.use_interactions = interactions
         self.f2i = dict()
         self.i2f = list()
         self.orig_features = features
@@ -50,16 +51,17 @@ class FeatureIndexer(object):
         self.i2f.append("MEAN_TF_SIM==0")
         i += 1
         self.int_start = i
-        for i, feat in enumerate(all_features[1:], i):
-            ifeat = feat +"^MAX_TF_SIM"    
-            self.f2i[ifeat] = i
-            self.i2f.append(ifeat)
-            assert self.i2f[self.f2i[ifeat]] == ifeat
-        for i, feat in enumerate(all_features[1:], i+1):
-            ifeat = feat +"^MEAN_TF_SIM"    
-            self.f2i[ifeat] = i
-            self.i2f.append(ifeat)
-            assert self.i2f[self.f2i[ifeat]] == ifeat
+        if interactions:
+            for i, feat in enumerate(all_features[1:], i):
+                ifeat = feat +"^MAX_TF_SIM"    
+                self.f2i[ifeat] = i
+                self.i2f.append(ifeat)
+                assert self.i2f[self.f2i[ifeat]] == ifeat
+            for i, feat in enumerate(all_features[1:], i+1):
+                ifeat = feat +"^MEAN_TF_SIM"    
+                self.f2i[ifeat] = i
+                self.i2f.append(ifeat)
+                assert self.i2f[self.f2i[ifeat]] == ifeat
 
     def make_static_data(self, vw, inputs):
         Xinp = inputs[self.orig_features].values 
